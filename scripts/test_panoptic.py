@@ -1,5 +1,4 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
-
 import argparse
 import time
 from collections import OrderedDict
@@ -14,6 +13,9 @@ from PIL import Image
 from skimage.morphology import dilation
 from skimage.segmentation import find_boundaries
 from torch import distributed
+
+from pathlib import Path
+import imageio
 
 import seamseg.models as models
 from seamseg.algos.detection import PredictionGenerator as BbxPredictionGenerator, DetectionLoss, \
@@ -50,8 +52,8 @@ parser.add_argument("out_dir", metavar="DIR", type=str, help="Path to output dir
 
 
 def log_debug(msg, *args, **kwargs):
-    if distributed.get_rank() == 0:
-        logging.get_logger().debug(msg, *args, **kwargs)
+    #if distributed.get_rank() == 0:
+    logging.get_logger().debug(msg, *args, **kwargs)
 
 
 def log_info(msg, *args, **kwargs):
@@ -76,13 +78,21 @@ def make_dataloader(args, config, rank, world_size):
     test_tf = ISSTestTransform(config.getint("shortest_size"),
                                config.getstruct("rgb_mean"),
                                config.getstruct("rgb_std"))
+
     test_db = ISSTestDataset(args.data, test_tf)
-    test_sampler = DistributedARBatchSampler(test_db, config.getint("val_batch_size"), world_size, rank, False)
-    test_dl = data.DataLoader(test_db,
-                              batch_sampler=test_sampler,
-                              collate_fn=iss_collate_fn,
-                              pin_memory=True,
-                              num_workers=config.getint("num_workers"))
+
+    print(f'Has length {len(test_db)}')
+
+    #test_sampler = DistributedARBatchSampler(test_db, config.getint("val_batch_size"), world_size, rank, False)
+    test_dl = data.DataLoader(
+        test_db,
+        batch_size=config.getint("val_batch_size"),
+        #batch_sampler=test_sampler,
+        collate_fn=iss_collate_fn,
+        pin_memory=True,
+        num_workers=config.getint("num_workers"),
+        shuffle=False
+    )
 
     return test_dl
 
@@ -180,9 +190,9 @@ def make_model(config, num_thing, num_stuff):
     return PanopticNet(body, rpn_head, roi_head, sem_head, rpn_algo, roi_algo, sem_algo, classes)
 
 
-def test(model, dataloader, **varargs):
+def test(out_dir, model, dataloader, **varargs):
+    
     model.eval()
-    dataloader.batch_sampler.set_epoch(0)
 
     data_time_meter = AverageMeter(())
     batch_time_meter = AverageMeter(())
@@ -193,13 +203,23 @@ def test(model, dataloader, **varargs):
 
     data_time = time.time()
     for it, batch in enumerate(dataloader):
+        print(f'On iter {it}')
         with torch.no_grad():
             # Extract data
-            img = batch["img"].cuda(device=varargs["device"], non_blocking=True)
+            img = batch["img"].cuda(non_blocking=True)
 
             data_time_meter.update(torch.tensor(time.time() - data_time))
 
             batch_time = time.time()
+
+            batch_sz = len(batch["abs_path"])
+            print('batch size: ', batch_sz) # batch size is 1
+            abs_path = batch["abs_path"][0]
+            fname_stem = Path(abs_path).stem
+            save_fpath = f'{out_dir}/{fname_stem}.png'
+            if Path(save_fpath).exists():
+                print(f'Skip, {it}/{len(dataloader)} exists')
+                continue
 
             # Run network
             _, pred, _ = model(img=img, do_loss=False, do_prediction=True)
@@ -216,12 +236,15 @@ def test(model, dataloader, **varargs):
                     "abs_path": batch["abs_path"][i]
                 }
 
-                # Compute panoptic output
-                panoptic_pred = make_panoptic(sem_pred, bbx_pred, cls_pred, obj_pred, msk_pred, num_stuff)
+                fname_stem = Path(img_info['abs_path']).stem
+                imageio.imwrite(f'{out_dir}/{fname_stem}.png', sem_pred.cpu().numpy().astype(np.uint8))
 
-                # Save prediction
-                raw_pred = (sem_pred, bbx_pred, cls_pred, obj_pred, msk_pred)
-                save_function(raw_pred, panoptic_pred, img_info)
+                # # Compute panoptic output
+                # panoptic_pred = make_panoptic(sem_pred, bbx_pred, cls_pred, obj_pred, msk_pred, num_stuff)
+
+                # # Save prediction
+                # raw_pred = (sem_pred, bbx_pred, cls_pred, obj_pred, msk_pred)
+                # save_function(raw_pred, panoptic_pred, img_info)
 
             # Log batch
             if varargs["summary"] is not None and (it + 1) % varargs["log_interval"] == 0:
@@ -302,14 +325,17 @@ def save_prediction_raw(raw_pred, _, img_info, out_dir):
 
 def main(args):
     # Initialize multi-processing
-    distributed.init_process_group(backend='nccl', init_method='env://')
-    device_id, device = args.local_rank, torch.device(args.local_rank)
-    rank, world_size = distributed.get_rank(), distributed.get_world_size()
-    torch.cuda.set_device(device_id)
+    #distributed.init_process_group(backend='nccl', init_method='env://')
+    #device_id, device = args.local_rank, torch.device(args.local_rank)
+    #rank, world_size = distributed.get_rank(), distributed.get_world_size()
+    #torch.cuda.set_device(device_id)
+
+    rank = 0
+    world_size = 0
 
     # Initialize logging
-    if rank == 0:
-        logging.init(args.log_dir, "test")
+    #if rank == 0:
+    logging.init(args.log_dir, "test")
 
     # Load configuration
     config = make_config(args)
@@ -327,7 +353,10 @@ def main(args):
 
     # Init GPU stuff
     torch.backends.cudnn.benchmark = config["general"].getboolean("cudnn_benchmark")
-    model = DistributedDataParallel(model.cuda(device), device_ids=[device_id], output_device=device_id)
+    #model = DistributedDataParallel(
+
+    model = model.cuda() #device) #, device_ids=[device_id], output_device=device_id)
+
 
     # Panoptic processing parameters
     panoptic_preprocessing = PanopticPreprocessing(args.score_threshold, args.iou_threshold, args.min_area)
@@ -345,9 +374,18 @@ def main(args):
 
         save_function = partial(
             save_prediction_image, out_dir=args.out_dir, colors=palette, num_stuff=meta["num_stuff"])
-    test(model, test_dataloader, device=device, summary=None,
-         log_interval=config["general"].getint("log_interval"), save_function=save_function,
-         make_panoptic=panoptic_preprocessing, num_stuff=meta["num_stuff"])
+    
+    test(
+        args.out_dir,
+        model,
+        test_dataloader,
+        device=None,
+        summary=None,
+        log_interval=config["general"].getint("log_interval"),
+        save_function=save_function,
+        make_panoptic=panoptic_preprocessing,
+        num_stuff=meta["num_stuff"]
+    )
 
 
 if __name__ == "__main__":
